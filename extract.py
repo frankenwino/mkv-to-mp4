@@ -5,6 +5,7 @@ import os
 import re
 import subprocess
 import sys
+import hashlib
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import multiprocessing
@@ -16,7 +17,7 @@ load_dotenv()
 # Apple TV target codec (H.264 for maximum compatibility)
 APPLE_TV_VIDEO_CODEC = 'h264'
 APPLE_TV_AUDIO_CODECS = {'aac', 'ac3', 'eac3'}
-APPLE_TV_SUBTITLE_CODECS = {'mov_text', 'srt', 'subrip', 'ass', 'ssa'}
+APPLE_TV_SUBTITLE_CODECS = {'mov_text', 'srt', 'subrip', 'ass', 'ssa', 'dvb_subtitle'}
 SUPPORTED_VIDEO_FORMATS = {'.mkv', '.mp4', '.avi', '.wmv', '.flv', '.mov', '.m4v', '.ts', '.webm', '.mpg', '.mpeg'}
 
 TVDB_API_KEY = os.getenv('TVDB_API_KEY')
@@ -164,6 +165,39 @@ def download_tmdb_image(poster_path):
     except Exception as e:
         log(f"TMDB image download failed: {e}", verbose=True)
     return None
+
+def check_handbrake_cli():
+    """Check if HandBrakeCLI is available."""
+    try:
+        result = subprocess.run(['HandBrakeCLI', '--version'], capture_output=True, text=True)
+        return result.returncode == 0
+    except FileNotFoundError:
+        return False
+
+def partial_hash(file_path, chunk_size=65536):
+    """Generate partial hash of file (first, middle, last chunks) for duplicate detection."""
+    try:
+        file_size = os.path.getsize(file_path)
+        hasher = hashlib.sha256()
+        
+        with open(file_path, 'rb') as f:
+            # Hash first chunk
+            hasher.update(f.read(chunk_size))
+            
+            # Hash middle chunk if file is large enough
+            if file_size > chunk_size * 2:
+                f.seek(file_size // 2)
+                hasher.update(f.read(chunk_size))
+            
+            # Hash last chunk if file is large enough
+            if file_size > chunk_size:
+                f.seek(max(0, file_size - chunk_size))
+                hasher.update(f.read(chunk_size))
+        
+        return hasher.hexdigest()
+    except Exception as e:
+        log(f"Failed to hash {file_path}: {e}", verbose=True)
+        return None
 
 def log(msg, verbose=False, force=False):
     if force or verbose:
@@ -314,10 +348,11 @@ def display_tracks(streams):
             info += f" - {title}"
         print(info)
     
-    # Auto-select: all video, all audio, only English/Swedish subtitles
+    # Auto-select: all video, all audio, only English/Swedish subtitles (excluding dvb_subtitle which can't be in MP4)
     auto_selected = []
     for idx, stream in enumerate(streams):
         stream_type = stream.get('codec_type')
+        codec = stream.get('codec_name', '')
         lang = stream.get('tags', {}).get('language', 'und')
         
         if stream_type == 'video':
@@ -325,12 +360,13 @@ def display_tracks(streams):
         elif stream_type == 'audio':
             auto_selected.append(idx)
         elif stream_type == 'subtitle':
-            if lang in ['eng', 'swe']:
+            # Skip dvb_subtitle as it's not compatible with MP4 container
+            if lang in ['eng', 'swe'] and codec != 'dvb_subtitle':
                 auto_selected.append(idx)
     
     if auto_selected:
         selected_nums = [str(i + 1) for i in auto_selected]
-        print(f"Auto-selected: {', '.join(selected_nums)} (video + all audio + English/Swedish subs)")
+        print(f"Auto-selected: {', '.join(selected_nums)} (video + all audio + English/Swedish subs, excluding dvb_subtitle)")
     
     return auto_selected
 
@@ -380,7 +416,7 @@ def extract_streams(mkv_path, output_path, selected_streams, info, image_data, v
     
     # Set cover art codec
     if image_input_idx:
-        cmd.extend(['-c:v:1', 'mjpeg', '-disposition:v:1', 'attached_pic'])
+        cmd.extend([f'-c:v:{video_idx}', 'mjpeg', f'-disposition:v:{video_idx}', 'attached_pic'])
     
     # Add metadata tags
     if info['type'] == 'tv':
@@ -415,11 +451,27 @@ def extract_streams(mkv_path, output_path, selected_streams, info, image_data, v
     
     return result.returncode == 0
 
-def get_unique_output_path(output_path):
-    """Get unique output path by appending number if file exists."""
+def get_unique_output_path(output_path, new_file_path=None, verbose=False):
+    """Get unique output path, checking for duplicates before appending number."""
     if not os.path.exists(output_path):
         return output_path
     
+    # If we have a new file to compare, check if it's a duplicate
+    if new_file_path and os.path.exists(new_file_path):
+        existing_hash = partial_hash(output_path)
+        new_hash = partial_hash(new_file_path)
+        
+        if existing_hash and new_hash and existing_hash == new_hash:
+            log(f"Duplicate detected: {output_path} is identical to new file", verbose, force=True)
+            # Delete the new file and return None to signal duplicate
+            try:
+                os.remove(new_file_path)
+                log(f"Deleted duplicate file: {new_file_path}", verbose, force=True)
+            except Exception as e:
+                log(f"Failed to delete duplicate: {e}", verbose, force=True)
+            return None
+    
+    # Not a duplicate, find unique name
     base_dir = os.path.dirname(output_path)
     stem = Path(output_path).stem
     ext = Path(output_path).suffix
@@ -431,83 +483,94 @@ def get_unique_output_path(output_path):
             return new_path
         counter += 1
 
-def reencode_file(mkv_path, output_dir, reason, verbose=False):
-    """Re-encode file using ffmpeg, preserving original quality parameters."""
+def reencode_file(mkv_path, output_dir, reason, info=None, verbose=False):
+    """Re-encode file using HandBrake CLI with H.264 preset."""
     temp_dir = os.path.join(output_dir, '.temp_reencoding')
     os.makedirs(temp_dir, exist_ok=True)
     
-    temp_output = os.path.join(temp_dir, Path(mkv_path).name)
+    # Output to MKV with same base name
+    temp_output = os.path.join(temp_dir, Path(mkv_path).stem + '.mkv')
     
     log(f"Re-encoding required ({reason}) - this will take time...", verbose, force=True)
     
-    # Probe for comprehensive video parameters
-    probe_cmd = ['ffprobe', '-v', 'quiet', '-select_streams', 'v:0', 
-                 '-show_entries', 'stream=width,height,r_frame_rate,bit_rate,pix_fmt,color_space,color_range', 
-                 '-of', 'json', mkv_path]
-    result = subprocess.run(probe_cmd, capture_output=True, text=True)
+    # Probe to get audio, subtitle, and video resolution information
+    probe_data = probe_file(mkv_path)
+    if not probe_data:
+        log("Failed to probe file for track information", verbose, force=True)
+        return None
     
-    # Parse quality parameters
-    width = height = fps = bitrate = pix_fmt = color_space = color_range = None
-    if result.returncode == 0:
-        try:
-            data = json.loads(result.stdout)
-            if data.get('streams'):
-                stream = data['streams'][0]
-                width = stream.get('width')
-                height = stream.get('height')
-                bitrate = int(stream['bit_rate']) if stream.get('bit_rate') else None
-                pix_fmt = stream.get('pix_fmt')
-                color_space = stream.get('color_space')
-                color_range = stream.get('color_range')
-                
-                # Parse frame rate (format: "24000/1001" or "24")
-                if stream.get('r_frame_rate'):
-                    fps_parts = stream['r_frame_rate'].split('/')
-                    if len(fps_parts) == 2:
-                        fps = float(fps_parts[0]) / float(fps_parts[1])
-                    else:
-                        fps = float(fps_parts[0])
-                
-                log(f"Original parameters: {width}x{height}, {fps:.2f}fps, bitrate={bitrate or 'N/A'}, pix_fmt={pix_fmt}", verbose, force=True)
-        except Exception as e:
-            log(f"Warning: Could not parse all parameters: {e}", verbose, force=True)
+    # Detect video resolution and frame rate to select appropriate preset
+    video_height = None
+    frame_rate = None
+    for stream in probe_data.get('streams', []):
+        if stream.get('codec_type') == 'video':
+            video_height = stream.get('height')
+            # Parse frame rate (format: "24000/1001" or "60")
+            if stream.get('r_frame_rate'):
+                fps_parts = stream['r_frame_rate'].split('/')
+                if len(fps_parts) == 2:
+                    frame_rate = float(fps_parts[0]) / float(fps_parts[1])
+                else:
+                    frame_rate = float(fps_parts[0])
+            break
     
-    cmd = ['ffmpeg', '-i', mkv_path]
+    # Determine if high frame rate (50/60fps)
+    is_high_fps = frame_rate and frame_rate >= 50
     
-    # Build encoding command with preserved parameters
-    cmd.extend(['-c:v', 'libx264', '-preset', 'medium'])
-    
-    # Use bitrate if available, otherwise use CRF
-    if bitrate:
-        bitrate_kbps = bitrate // 1000
-        cmd.extend(['-b:v', f'{bitrate_kbps}k'])
+    # Select HandBrake preset based on resolution and frame rate (capped at 1080p)
+    if video_height:
+        if video_height <= 480:
+            preset = 'H.264 MKV 480p30'
+            log(f"Detected {video_height}p @ {frame_rate:.2f}fps, using H.264 MKV 480p30 preset", verbose, force=True)
+        elif video_height <= 576:
+            preset = 'H.264 MKV 576p25'
+            log(f"Detected {video_height}p @ {frame_rate:.2f}fps, using H.264 MKV 576p25 preset", verbose, force=True)
+        elif video_height <= 720:
+            preset = 'H.264 MKV 720p30'
+            log(f"Detected {video_height}p @ {frame_rate:.2f}fps, using H.264 MKV 720p30 preset", verbose, force=True)
+        else:
+            # Cap at 1080p for all higher resolutions
+            preset = 'H.264 MKV 1080p30'
+            log(f"Detected {video_height}p @ {frame_rate:.2f}fps, using H.264 MKV 1080p30 preset (capped at 1080p)", verbose, force=True)
     else:
-        log("Could not detect bitrate, using CRF 23", verbose, force=True)
-        cmd.extend(['-crf', '23'])
+        preset = 'H.264 MKV 1080p30'
+        log("Could not detect resolution, defaulting to H.264 MKV 1080p30 preset", verbose, force=True)
     
-    # Preserve resolution
-    if width and height:
-        cmd.extend(['-s', f'{width}x{height}'])
+    # Collect all audio and subtitle track indices (HandBrake uses per-type indexing starting from 1)
+    audio_track_nums = []
+    subtitle_track_nums = []
     
-    # Preserve frame rate
-    if fps:
-        cmd.extend(['-r', str(fps)])
+    audio_count = 0
+    subtitle_count = 0
     
-    # Preserve pixel format
-    if pix_fmt:
-        cmd.extend(['-pix_fmt', pix_fmt])
+    for stream in probe_data.get('streams', []):
+        stream_type = stream.get('codec_type')
+        lang = stream.get('tags', {}).get('language', 'und')
+        
+        if stream_type == 'audio':
+            audio_count += 1
+            audio_track_nums.append(str(audio_count))
+        elif stream_type == 'subtitle':
+            subtitle_count += 1
+            if lang in ['eng', 'swe']:
+                subtitle_track_nums.append(str(subtitle_count))
     
-    # Preserve color space and range
-    if color_space and color_space != 'unknown':
-        cmd.extend(['-colorspace', color_space])
-    if color_range and color_range != 'unknown':
-        cmd.extend(['-color_range', color_range])
+    # Build HandBrake command
+    cmd = ['HandBrakeCLI', '-i', mkv_path, '-o', temp_output]
+    cmd.extend(['--preset', preset])
     
-    cmd.extend(['-c:a', 'copy', '-c:s', 'copy', temp_output])
+    # Add all audio tracks
+    if audio_track_nums:
+        cmd.extend(['--audio', ','.join(audio_track_nums)])
+        cmd.extend(['--aencoder', ','.join(['copy'] * len(audio_track_nums))])
     
-    if not verbose:
-        cmd.extend(['-v', 'quiet', '-stats'])
+    # Add English/Swedish subtitles
+    if subtitle_track_nums:
+        cmd.extend(['--subtitle', ','.join(subtitle_track_nums)])
     
+    log(f"Running: {' '.join(cmd)}", verbose, force=True)
+    
+    # Always show HandBrake progress (it outputs to stderr)
     result = subprocess.run(cmd)
     
     if result.returncode == 0:
@@ -532,7 +595,7 @@ def process_file(mkv_path, output_dir, verbose=False, force_process=False, conte
     reencode_reason = None
     video_codec = None
     
-    # Check for DARKFLiX (takes priority)
+    # Check for DARKFLiX
     if 'darkflix' in mkv_path.lower():
         needs_reencode = True
         reencode_reason = "DARKFLiX"
@@ -547,15 +610,94 @@ def process_file(mkv_path, output_dir, verbose=False, force_process=False, conte
                     reencode_reason = video_codec.upper()
                     break
     
-    # Defer non-H.264 files to second pass unless forced (except DARKFLiX)
-    if needs_reencode and reencode_reason != "DARKFLiX" and not force_process:
+    # Defer all re-encode files to second pass unless forced
+    if needs_reencode and not force_process:
         log(f"{reencode_reason} detected - deferring to end of queue", verbose, force=True)
         return False, f"{reencode_reason} deferred"
     
+    # Extract metadata from file early (needed for re-encoding)
+    file_metadata = extract_file_metadata(mkv_path)
+    log(f"File metadata: {file_metadata}", verbose)
+    
+    # Parse filename
+    info = parse_filename(mkv_path)
+    image_data = None
+    
+    # Merge file metadata with parsed info
+    if not info.get('year') and file_metadata.get('year'):
+        info['year'] = file_metadata['year']
+        log(f"Using year from file metadata: {info['year']}", verbose)
+    
+    # Override content type if specified
+    if content_type != 'auto':
+        info['type'] = content_type
+    
+    # Fetch metadata from APIs before re-encoding
+    if info['type'] == 'tv':
+        year_display = info['year'] if info['year'] else 'Unknown'
+        log(f"TV Show: {info['show']} ({year_display}) - S{info['season']:02d}E{info['episode']:02d} - {info['episode_title']}", verbose, force=True)
+        
+        # Fetch metadata from TVDB
+        token = get_tvdb_token()
+        if token:
+            log("Fetching metadata from TVDB...", verbose, force=True)
+            
+            series_id = search_tvdb_series(info['show'], token)
+            
+            if not series_id and file_metadata.get('title') and file_metadata['title'] != info['show']:
+                log(f"Trying TVDB search with metadata title: {file_metadata['title']}", verbose, force=True)
+                series_id = search_tvdb_series(file_metadata['title'], token)
+            
+            if series_id:
+                episode_data = get_tvdb_episode(series_id, info['season'], info['episode'], token)
+                if episode_data:
+                    if episode_data.get('name'):
+                        info['episode_title'] = episode_data['name']
+                    if episode_data.get('overview'):
+                        info['overview'] = episode_data['overview']
+                    if not info['year'] and episode_data.get('aired'):
+                        info['year'] = episode_data['aired'][:4]
+                
+                artwork_url = get_tvdb_series_artwork(series_id, token)
+                if artwork_url:
+                    if not artwork_url.startswith('http'):
+                        artwork_url = f"https://artworks.thetvdb.com{artwork_url}"
+                    image_data = download_image(artwork_url, token)
+                    if image_data:
+                        log("Downloaded series artwork", verbose, force=True)
+    elif info['type'] == 'movie':
+        year_display = info['year'] if info['year'] else 'Unknown'
+        log(f"Movie: {info['title']} ({year_display})", verbose, force=True)
+        
+        if TMDB_ACCESS_TOKEN:
+            log("Fetching metadata from TMDB...", verbose, force=True)
+            
+            movie_id = search_tmdb_movie(info['title'], info['year'])
+            
+            if not movie_id and file_metadata.get('title') and file_metadata['title'] != info['title']:
+                log(f"Trying TMDB search with metadata title: {file_metadata['title']}", verbose, force=True)
+                movie_id = search_tmdb_movie(file_metadata['title'], info['year'])
+            
+            if movie_id:
+                movie_data = get_tmdb_movie_details(movie_id)
+                if movie_data:
+                    if movie_data.get('title'):
+                        info['title'] = movie_data['title']
+                    if movie_data.get('overview'):
+                        info['overview'] = movie_data['overview']
+                    if not info['year'] and movie_data.get('release_date'):
+                        info['year'] = movie_data['release_date'][:4]
+                    
+                    if movie_data.get('poster_path'):
+                        image_data = download_tmdb_image(movie_data['poster_path'])
+                        if image_data:
+                            log("Downloaded movie poster", verbose, force=True)
+    
+    # Now perform re-encoding with metadata if needed
     temp_file = None
     if needs_reencode:
         log(f"{reencode_reason} detected - re-encoding required", verbose, force=True)
-        temp_file = reencode_file(mkv_path, output_dir, reencode_reason, verbose)
+        temp_file = reencode_file(mkv_path, output_dir, reencode_reason, info, verbose)
         if not temp_file:
             return False, "Re-encoding failed"
         processing_path = temp_file
@@ -568,61 +710,8 @@ def process_file(mkv_path, output_dir, verbose=False, force_process=False, conte
     else:
         processing_path = mkv_path
     
-    # Extract metadata from file
-    file_metadata = extract_file_metadata(mkv_path)
-    log(f"File metadata: {file_metadata}", verbose)
-    
-    # Parse filename
-    info = parse_filename(mkv_path)
-    image_data = None
-    
-    # Merge file metadata with parsed info (filename takes priority for structure, metadata for search)
-    if not info.get('year') and file_metadata.get('year'):
-        info['year'] = file_metadata['year']
-        log(f"Using year from file metadata: {info['year']}", verbose)
-    
-    # Override content type if specified
-    if content_type != 'auto':
-        info['type'] = content_type
-    
+    # Build output path
     if info['type'] == 'tv':
-        year_display = info['year'] if info['year'] else 'Unknown'
-        log(f"TV Show: {info['show']} ({year_display}) - S{info['season']:02d}E{info['episode']:02d} - {info['episode_title']}", verbose, force=True)
-        
-        # Fetch metadata from TVDB
-        token = get_tvdb_token()
-        if token:
-            log("Fetching metadata from TVDB...", verbose, force=True)
-            
-            # Try with filename show name first
-            series_id = search_tvdb_series(info['show'], token)
-            
-            # If not found and we have metadata title, try that
-            if not series_id and file_metadata.get('title') and file_metadata['title'] != info['show']:
-                log(f"Trying TVDB search with metadata title: {file_metadata['title']}", verbose, force=True)
-                series_id = search_tvdb_series(file_metadata['title'], token)
-            
-            if series_id:
-                episode_data = get_tvdb_episode(series_id, info['season'], info['episode'], token)
-                if episode_data:
-                    # Update info with TVDB data
-                    if episode_data.get('name'):
-                        info['episode_title'] = episode_data['name']
-                    if episode_data.get('overview'):
-                        info['overview'] = episode_data['overview']
-                    # Get year from episode if not in filename
-                    if not info['year'] and episode_data.get('aired'):
-                        info['year'] = episode_data['aired'][:4]
-                
-                # Get series artwork (poster)
-                artwork_url = get_tvdb_series_artwork(series_id, token)
-                if artwork_url:
-                    if not artwork_url.startswith('http'):
-                        artwork_url = f"https://artworks.thetvdb.com{artwork_url}"
-                    image_data = download_image(artwork_url, token)
-                    if image_data:
-                        log("Downloaded series artwork", verbose, force=True)
-        
         # Use year or omit for folder name
         if info['year']:
             show_dir = os.path.join(output_dir, f"{info['show']} ({info['year']})")
@@ -632,40 +721,7 @@ def process_file(mkv_path, output_dir, verbose=False, force_process=False, conte
         os.makedirs(season_dir, exist_ok=True)
         output_name = f"{info['show']} S{info['season']:02d}E{info['episode']:02d} {info['episode_title']}.mp4"
         output_path = os.path.join(season_dir, output_name)
-        output_path = get_unique_output_path(output_path)
     elif info['type'] == 'movie':
-        year_display = info['year'] if info['year'] else 'Unknown'
-        log(f"Movie: {info['title']} ({year_display})", verbose, force=True)
-        
-        # Fetch metadata from TMDB
-        if TMDB_ACCESS_TOKEN:
-            log("Fetching metadata from TMDB...", verbose, force=True)
-            
-            # Try with filename title first
-            movie_id = search_tmdb_movie(info['title'], info['year'])
-            
-            # If not found and we have metadata title, try that
-            if not movie_id and file_metadata.get('title') and file_metadata['title'] != info['title']:
-                log(f"Trying TMDB search with metadata title: {file_metadata['title']}", verbose, force=True)
-                movie_id = search_tmdb_movie(file_metadata['title'], info['year'])
-            
-            if movie_id:
-                movie_data = get_tmdb_movie_details(movie_id)
-                if movie_data:
-                    # Update info with TMDB data
-                    if movie_data.get('title'):
-                        info['title'] = movie_data['title']
-                    if movie_data.get('overview'):
-                        info['overview'] = movie_data['overview']
-                    if not info['year'] and movie_data.get('release_date'):
-                        info['year'] = movie_data['release_date'][:4]
-                    
-                    # Get movie poster
-                    if movie_data.get('poster_path'):
-                        image_data = download_tmdb_image(movie_data['poster_path'])
-                        if image_data:
-                            log("Downloaded movie poster", verbose, force=True)
-        
         # Create Jellyfin-compatible folder structure
         if info['year']:
             movie_dir = os.path.join(output_dir, f"{info['title']} ({info['year']})")
@@ -706,6 +762,28 @@ def process_file(mkv_path, output_dir, verbose=False, force_process=False, conte
     log(f"Extracting to: {output_path}", verbose, force=True)
     success = extract_streams(processing_path, output_path, selected_streams, info, image_data, verbose)
     
+    # After successful extraction, check if final file has subtitles and update metadata if needed
+    if success and os.path.exists(output_path) and info['type'] == 'tv':
+        final_probe = probe_file(output_path)
+        if final_probe:
+            has_subs = False
+            for stream in final_probe.get('streams', []):
+                if stream.get('codec_type') == 'subtitle':
+                    has_subs = True
+                    break
+            
+            # If no subtitles in final file, prepend "(No Subs)" to episode title
+            if not has_subs and not info['episode_title'].startswith('(No Subs)'):
+                info['episode_title'] = f"(No Subs) {info['episode_title']}"
+                # Rename file to include (No Subs) in filename
+                old_path = output_path
+                season_dir = os.path.dirname(output_path)
+                output_name = f"{info['show']} S{info['season']:02d}E{info['episode']:02d} {info['episode_title']}.mp4"
+                output_path = os.path.join(season_dir, output_name)
+                if old_path != output_path:
+                    os.rename(old_path, output_path)
+                    log(f"Renamed to include (No Subs): {output_path}", verbose, force=True)
+    
     # Cleanup temp file
     if temp_file and os.path.exists(temp_file):
         os.remove(temp_file)
@@ -715,7 +793,7 @@ def process_file(mkv_path, output_dir, verbose=False, force_process=False, conte
             os.rmdir(temp_dir)
     
     if success:
-        return True, "Success"
+        return True, output_path
     else:
         return False, "Extraction failed"
 
@@ -762,6 +840,15 @@ def main():
     
     args = parser.parse_args()
     
+    # Check if HandBrakeCLI is available
+    if not check_handbrake_cli():
+        print("ERROR: HandBrakeCLI is not installed or not in PATH.")
+        print("\nTo install HandBrake CLI:")
+        print("  Ubuntu/Debian: sudo apt install handbrake-cli")
+        print("  macOS: brew install handbrake")
+        print("  Or download from: https://handbrake.fr/downloads.php")
+        return 1
+    
     # Validate workers argument
     max_workers = multiprocessing.cpu_count()
     if args.workers < 1:
@@ -789,11 +876,11 @@ def main():
     if args.workers == 1:
         # Sequential processing
         for mkv_file in mkv_files:
-            success, message = process_file(mkv_file, str(output_dir), args.verbose, content_type=args.type)
+            success, message = process_file(mkv_file, str(output_dir), args.verbose, False, args.type)
             if message and "deferred" in message:
                 results['deferred'].append(mkv_file)
             elif success:
-                results['success'].append(mkv_file)
+                results['success'].append((mkv_file, message))  # message is output_path
             else:
                 results['failed'].append((mkv_file, message))
     else:
@@ -811,7 +898,7 @@ def main():
                     if message and "deferred" in message:
                         results['deferred'].append(mkv_file)
                     elif success:
-                        results['success'].append(mkv_file)
+                        results['success'].append((mkv_file, message))  # message is output_path
                     else:
                         results['failed'].append((mkv_file, message))
                 except Exception as e:
@@ -826,9 +913,9 @@ def main():
         if args.workers == 1:
             # Sequential processing
             for mkv_file in results['deferred']:
-                success, message = process_file(mkv_file, str(output_dir), args.verbose, force_process=True, content_type=args.type)
+                success, message = process_file(mkv_file, str(output_dir), args.verbose, True, args.type)
                 if success:
-                    results['success'].append(mkv_file)
+                    results['success'].append((mkv_file, message))  # message is output_path
                 else:
                     results['failed'].append((mkv_file, message))
         else:
@@ -844,7 +931,7 @@ def main():
                     try:
                         success, message = future.result()
                         if success:
-                            results['success'].append(mkv_file)
+                            results['success'].append((mkv_file, message))  # message is output_path
                         else:
                             results['failed'].append((mkv_file, message))
                     except Exception as e:
@@ -855,6 +942,11 @@ def main():
     print("="*60)
     print(f"Successful: {len(results['success'])}")
     print(f"Failed: {len(results['failed'])}")
+    
+    if results['success']:
+        print("\nSuccessful conversions:")
+        for source, output in results['success']:
+            print(f"  {source} → {output}")
     
     if results['failed']:
         print("\nFailed files:")
