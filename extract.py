@@ -174,6 +174,22 @@ def check_handbrake_cli():
     except FileNotFoundError:
         return False
 
+def check_ffmpeg():
+    """Check if ffmpeg is available."""
+    try:
+        result = subprocess.run(['ffmpeg', '-version'], capture_output=True, text=True)
+        return result.returncode == 0
+    except FileNotFoundError:
+        return False
+
+def check_ffprobe():
+    """Check if ffprobe is available."""
+    try:
+        result = subprocess.run(['ffprobe', '-version'], capture_output=True, text=True)
+        return result.returncode == 0
+    except FileNotFoundError:
+        return False
+
 def partial_hash(file_path, chunk_size=65536):
     """Generate partial hash of file (first, middle, last chunks) for duplicate detection."""
     try:
@@ -372,7 +388,7 @@ def display_tracks(streams):
 
 def extract_streams(mkv_path, output_path, selected_streams, info, image_data, verbose=False):
     """Extract selected streams to MP4."""
-    cmd = ['ffmpeg', '-i', mkv_path]
+    cmd = ['ffmpeg', '-y', '-i', mkv_path]
     
     # Add image as input if available
     image_input_idx = None
@@ -721,6 +737,7 @@ def process_file(mkv_path, output_dir, verbose=False, force_process=False, conte
         os.makedirs(season_dir, exist_ok=True)
         output_name = f"{info['show']} S{info['season']:02d}E{info['episode']:02d} {info['episode_title']}.mp4"
         output_path = os.path.join(season_dir, output_name)
+        output_path = get_unique_output_path(output_path)
     elif info['type'] == 'movie':
         # Create Jellyfin-compatible folder structure
         if info['year']:
@@ -759,8 +776,52 @@ def process_file(mkv_path, output_dir, verbose=False, force_process=False, conte
     
     selected_streams = [compatible[i] for i in selected_indices]
     
+    # Check if any subtitles are selected for TV shows
+    if info['type'] == 'tv':
+        has_subs = any(s.get('codec_type') == 'subtitle' for s in selected_streams)
+        if not has_subs and not info['episode_title'].startswith('(No Subs)'):
+            info['episode_title'] = f"(No Subs) {info['episode_title']}"
+            # Update output path with new episode title
+            season_dir = os.path.dirname(output_path)
+            output_name = f"{info['show']} S{info['season']:02d}E{info['episode']:02d} {info['episode_title']}.mp4"
+            output_path = os.path.join(season_dir, output_name)
+            output_path = get_unique_output_path(output_path)
+            log(f"No subtitles found - prepending (No Subs) to episode title", verbose, force=True)
+    
     log(f"Extracting to: {output_path}", verbose, force=True)
     success = extract_streams(processing_path, output_path, selected_streams, info, image_data, verbose)
+    
+    # After successful extraction, check for duplicates based on hash
+    if success and os.path.exists(output_path):
+        # Check if there are other files with similar names (without number suffix)
+        base_dir = os.path.dirname(output_path)
+        base_name = Path(output_path).stem
+        
+        # Remove any existing (N) suffix from base_name to find the original
+        original_base = re.sub(r' \(\d+\)$', '', base_name)
+        
+        # Look for the original file (without number suffix)
+        original_path = os.path.join(base_dir, f"{original_base}{Path(output_path).suffix}")
+        
+        if original_path != output_path and os.path.exists(original_path):
+            # Compare hashes
+            new_hash = partial_hash(output_path)
+            existing_hash = partial_hash(original_path)
+            
+            if new_hash and existing_hash and new_hash == existing_hash:
+                log(f"Duplicate detected: {output_path} is identical to {original_path}", verbose, force=True)
+                try:
+                    os.remove(output_path)
+                    log(f"Deleted duplicate file: {output_path}", verbose, force=True)
+                    # Cleanup temp file
+                    if temp_file and os.path.exists(temp_file):
+                        os.remove(temp_file)
+                        temp_dir = os.path.dirname(temp_file)
+                        if os.path.exists(temp_dir) and not os.listdir(temp_dir):
+                            os.rmdir(temp_dir)
+                    return False, "Duplicate file (deleted)"
+                except Exception as e:
+                    log(f"Failed to delete duplicate: {e}", verbose, force=True)
     
     # After successful extraction, check if final file has subtitles and update metadata if needed
     if success and os.path.exists(output_path) and info['type'] == 'tv':
@@ -840,13 +901,23 @@ def main():
     
     args = parser.parse_args()
     
-    # Check if HandBrakeCLI is available
+    # Check if required tools are available
+    missing_tools = []
     if not check_handbrake_cli():
-        print("ERROR: HandBrakeCLI is not installed or not in PATH.")
-        print("\nTo install HandBrake CLI:")
-        print("  Ubuntu/Debian: sudo apt install handbrake-cli")
-        print("  macOS: brew install handbrake")
-        print("  Or download from: https://handbrake.fr/downloads.php")
+        missing_tools.append("HandBrakeCLI")
+    if not check_ffmpeg():
+        missing_tools.append("ffmpeg")
+    if not check_ffprobe():
+        missing_tools.append("ffprobe")
+    
+    if missing_tools:
+        print(f"ERROR: The following required tools are not installed or not in PATH: {', '.join(missing_tools)}")
+        print("\nTo install:")
+        print("  Ubuntu/Debian: sudo apt install handbrake-cli ffmpeg")
+        print("  macOS: brew install handbrake ffmpeg")
+        print("  Or download from:")
+        print("    HandBrake: https://handbrake.fr/downloads.php")
+        print("    ffmpeg: https://ffmpeg.org")
         return 1
     
     # Validate workers argument
